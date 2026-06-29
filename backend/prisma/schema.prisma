@@ -1,0 +1,275 @@
+// ============================================================================
+// PORTAL AUDITORIA MEGA - Schema do Banco de Dados
+// ============================================================================
+// Modelagem pensada para refletir 1:1 as colunas que chegam do Google Forms
+// (via Google Sheets), mais as entidades de domínio que o Portal precisa
+// para análise da Auditoria: status, histórico, alertas, risco e logs.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// ENUMS
+// ----------------------------------------------------------------------------
+
+enum PerfilUsuario {
+  ADMINISTRADOR
+  AUDITORIA
+  CONSULTA
+}
+
+enum StatusJustificativa {
+  RECEBIDO
+  EM_ANALISE
+  APROVADO
+  REPROVADO
+  SOLICITADO_COMPLEMENTACAO
+}
+
+enum NivelRisco {
+  BAIXO
+  MEDIO
+  ALTO
+  CRITICO
+}
+
+enum TipoAlerta {
+  VALOR_DIARIO_EXCEDIDO // loja > R$100 em ajustes no dia
+  FREQUENCIA_MENSAL_EXCEDIDA // loja com mais de 3 justificativas no mês
+  PENDENCIA_PROLONGADA // justificativa pendente > 24h
+  CRESCIMENTO_REGIONAL // regional com crescimento > 30% nas ocorrências
+}
+
+enum SeveridadeAlerta {
+  INFO
+  ATENCAO
+  CRITICO
+}
+
+// ----------------------------------------------------------------------------
+// ESTRUTURA ORGANIZACIONAL
+// ----------------------------------------------------------------------------
+
+model Regional {
+  id            String   @id @default(cuid())
+  nome          String   @unique
+  codigo        String?  @unique
+  responsavelId String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  responsavel Usuario? @relation(fields: [responsavelId], references: [id])
+  lojas       Loja[]
+
+  @@index([responsavelId])
+  @@map("regionais")
+}
+
+model Loja {
+  id         String   @id @default(cuid())
+  codigo     String   @unique // código da loja, conforme vem no Forms
+  nome       String
+  cidade     String?
+  uf         String?
+  regionalId String?
+  gerente    String? // nome do gerente responsável, texto livre vindo do Forms
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  regional       Regional?       @relation(fields: [regionalId], references: [id])
+  justificativas Justificativa[]
+
+  @@index([regionalId])
+  @@map("lojas")
+}
+
+// ----------------------------------------------------------------------------
+// USUÁRIOS E SEGURANÇA
+// ----------------------------------------------------------------------------
+
+model Usuario {
+  id           String        @id @default(cuid())
+  nome         String
+  email        String        @unique
+  senhaHash    String
+  perfil       PerfilUsuario @default(CONSULTA)
+  ativo        Boolean       @default(true)
+  ultimoLogin  DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  analises             AnaliseAuditoria[]
+  comentarios          Comentario[]
+  logsAcesso           LogAcesso[]
+  regionaisResponsavel Regional[]
+
+  @@map("usuarios")
+}
+
+model LogAcesso {
+  id        String   @id @default(cuid())
+  usuarioId String?
+  acao      String // ex: LOGIN, LOGOUT, EXPORTOU_RELATORIO, ALTEROU_STATUS
+  entidade  String? // ex: Justificativa, Usuario
+  entidadeId String?
+  detalhes  String? // JSON serializado com detalhes adicionais
+  ip        String?
+  createdAt DateTime @default(now())
+
+  usuario Usuario? @relation(fields: [usuarioId], references: [id])
+
+  @@index([usuarioId])
+  @@index([createdAt])
+  @@map("logs_acesso")
+}
+
+// ----------------------------------------------------------------------------
+// JUSTIFICATIVAS (origem: respostas do Google Forms via Google Sheets)
+// ----------------------------------------------------------------------------
+
+model Justificativa {
+  id String @id @default(cuid())
+
+  // --- Identificação da origem (Google Sheets) ---
+  sheetRowId       String  @unique // identificador estável da linha + item (linha do Sheets + índice do produto)
+  sheetRowIndex    Int? // número da linha na planilha, para depuração
+  submissaoId      String? // agrupa várias Justificativas geradas pela MESMA resposta do Forms
+                            // (quando uma resposta lista vários códigos de produto, cada código
+                            // vira uma Justificativa própria, mas todas compartilham submissaoId)
+  itemDaSubmissao  Int?    @default(1) // posição do produto dentro da submissão (1 = primeiro)
+
+  // --- Dados enviados no formulário ---
+  dataEnvio      DateTime // "Carimbo de data/hora" — quando a loja preencheu o Forms
+  dataOcorrencia DateTime? // "Data do ajuste" — quando o ajuste de estoque de fato ocorreu
+  lojaId         String?
+  lojaCodigoBruto String  // código/nome da loja como veio no Forms (antes do match)
+  produtoCodigo  String?
+  produtoNome    String?
+  quantidade     Decimal? @db.Decimal(12, 2)
+  valorAjustado  Decimal  @db.Decimal(12, 2)
+  motivo         String
+  motivoDetalhe  String? @db.Text
+  responsavel    String? // quem preencheu o formulário na loja
+  gerenteBruto   String? // gerente informado no Forms (texto livre)
+  anexosUrls     String[] // URLs dos anexos enviados via Forms (Google Drive)
+
+  // --- Estado de auditoria ---
+  status         StatusJustificativa @default(RECEBIDO)
+  nivelRisco     NivelRisco?
+  scoreRisco     Decimal?            @db.Decimal(5, 2)
+
+  // --- Métricas de tempo ---
+  dataPrimeiraAnalise DateTime?
+  dataConclusao       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  loja      Loja?              @relation(fields: [lojaId], references: [id])
+  analises  AnaliseAuditoria[]
+  historico HistoricoStatus[]
+  comentarios Comentario[]
+  alertas   Alerta[]
+
+  @@index([lojaId])
+  @@index([status])
+  @@index([dataEnvio])
+  @@index([nivelRisco])
+  @@index([submissaoId])
+  @@map("justificativas")
+}
+
+// Parecer/análise feita pela Auditoria sobre uma justificativa
+model AnaliseAuditoria {
+  id               String              @id @default(cuid())
+  justificativaId  String
+  auditorId        String
+  status           StatusJustificativa
+  parecerTecnico   String              @db.Text
+  observacoes      String?             @db.Text
+  createdAt        DateTime            @default(now())
+
+  justificativa Justificativa @relation(fields: [justificativaId], references: [id])
+  auditor       Usuario       @relation(fields: [auditorId], references: [id])
+
+  @@index([justificativaId])
+  @@map("analises_auditoria")
+}
+
+// Registro de cada mudança de status (trilha de auditoria do próprio processo)
+model HistoricoStatus {
+  id              String              @id @default(cuid())
+  justificativaId String
+  statusAnterior  StatusJustificativa?
+  statusNovo      StatusJustificativa
+  usuarioId       String?
+  observacao      String?
+  createdAt       DateTime            @default(now())
+
+  justificativa Justificativa @relation(fields: [justificativaId], references: [id])
+
+  @@index([justificativaId])
+  @@map("historico_status")
+}
+
+model Comentario {
+  id              String   @id @default(cuid())
+  justificativaId String
+  usuarioId       String
+  texto           String   @db.Text
+  createdAt       DateTime @default(now())
+
+  justificativa Justificativa @relation(fields: [justificativaId], references: [id])
+  usuario       Usuario       @relation(fields: [usuarioId], references: [id])
+
+  @@index([justificativaId])
+  @@map("comentarios")
+}
+
+// ----------------------------------------------------------------------------
+// ALERTAS
+// ----------------------------------------------------------------------------
+
+model Alerta {
+  id              String           @id @default(cuid())
+  tipo            TipoAlerta
+  severidade      SeveridadeAlerta
+  titulo          String
+  descricao       String           @db.Text
+  lojaId          String?
+  regionalId      String?
+  justificativaId String?
+  lido            Boolean          @default(false)
+  resolvido       Boolean          @default(false)
+  createdAt       DateTime         @default(now())
+
+  justificativa Justificativa? @relation(fields: [justificativaId], references: [id])
+
+  @@index([tipo])
+  @@index([resolvido])
+  @@index([createdAt])
+  @@map("alertas")
+}
+
+// ----------------------------------------------------------------------------
+// CONTROLE DE SINCRONIZAÇÃO COM GOOGLE SHEETS
+// ----------------------------------------------------------------------------
+
+model SyncControl {
+  id                String   @id @default(cuid())
+  fonte             String   @unique // ex: "google_sheets_respostas"
+  ultimaLinhaLida   Int      @default(0)
+  ultimaSincronia   DateTime?
+  ultimoStatus      String? // SUCESSO | ERRO
+  ultimaMensagemErro String? @db.Text
+  updatedAt         DateTime @updatedAt
+
+  @@map("sync_control")
+}
